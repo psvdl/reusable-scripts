@@ -35,6 +35,12 @@
     Optional. Suspend pools even when sys.dm_pdw_exec_requests holds no rows (DMV history is
     cleared on resume/scale, so by default these pools are skipped as a safety measure).
 
+.PARAMETER ExcludedLoginNames
+    Optional. SQL logins whose activity is ignored when measuring idleness. Defaults to
+    'System' (internal engine requests, e.g. automated backups). The monitoring identity's
+    own login is always excluded automatically via SUSER_SNAME() - this also covers the
+    unlabelled 'USE <database>' statement that Invoke-Sqlcmd emits on every connection.
+
 .EXAMPLE
     .\Suspend-IdleSynapseSqlPools.ps1 -SubscriptionId '11111111-2222-3333-4444-555555555555' -Action Suspend
 
@@ -75,7 +81,10 @@ param (
     [string]$UserAssignedIdentityClientId,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SuspendWhenNoRequestHistory
+    [switch]$SuspendWhenNoRequestHistory,
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$ExcludedLoginNames = @('System')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,6 +128,18 @@ if (-not $workspaces) {
 Write-Output "Found $($workspaces.Count) Synapse workspace(s)."
 #endregion
 
+# Build a safe T-SQL IN-list of logins to ignore. The monitoring identity is always
+# excluded via SUSER_SNAME(); ExcludedLoginNames covers internal/monitoring logins.
+# Values are validated and single-quote-escaped to keep the generated SQL safe.
+$excludedLoginLiterals = ''
+if ($ExcludedLoginNames) {
+    $literals = foreach ($login in $ExcludedLoginNames) {
+        if ($login -notmatch "^[\w\s@.\-']+$") { throw "ExcludedLoginNames contains an unsafe value: '$login'" }
+        "'$($login -replace "'", "''")'"
+    }
+    $excludedLoginLiterals = ', ' + ($literals -join ', ')
+}
+
 $results  = [System.Collections.Generic.List[object]]::new()
 $failures = 0
 
@@ -146,12 +167,23 @@ foreach ($workspace in $workspaces) {
             continue
         }
 
-        # Idle check: active requests + last completed request time (DMV times are UTC)
+        # Idle check: active requests + last completed request time (DMV times are UTC).
+        # Self-interference is excluded by LOGIN, not just by label: Invoke-Sqlcmd emits an
+        # unlabelled 'USE <db>' statement on every connection, so the script's own session
+        # (SUSER_SNAME()) is filtered out entirely. 'System' (internal engine requests such
+        # as automated backups) and any -ExcludedLoginNames are ignored as well.
+        # Requests whose session has aged out of sys.dm_pdw_exec_sessions (login NULL) are
+        # still counted - conservative on purpose.
         $idleQuery = @"
-SELECT ActiveRequests    = (SELECT COUNT(*)       FROM sys.dm_pdw_exec_requests
-                            WHERE [status] IN ('Running', 'Suspended')),
-       LastRequestEndUtc = (SELECT MAX([end_time]) FROM sys.dm_pdw_exec_requests
-                            WHERE [end_time] IS NOT NULL);
+SELECT ActiveRequests    = (SELECT COUNT(*)         FROM sys.dm_pdw_exec_requests r
+                            LEFT JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+                            WHERE r.[status] IN ('Running', 'Suspended')
+                              AND (s.login_name IS NULL OR s.login_name NOT IN (SUSER_SNAME()$excludedLoginLiterals))),
+       LastRequestEndUtc = (SELECT MAX(r.[end_time]) FROM sys.dm_pdw_exec_requests r
+                            LEFT JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+                            WHERE r.[end_time] IS NOT NULL
+                              AND (s.login_name IS NULL OR s.login_name NOT IN (SUSER_SNAME()$excludedLoginLiterals)))
+OPTION (LABEL = 'synapse_idle_check');
 "@
 
         try {
